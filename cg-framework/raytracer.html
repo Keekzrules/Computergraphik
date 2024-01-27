@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>CG - Raytracer</title>
+    <link rel="stylesheet" href="./css/style.css">
+</head>
+
+
+<body>
+    <!-- glMatrix: A vector/matrix library for WebGL, https://glmatrix.net/ -->
+    <script src="./js/gl-matrix.js"></script>
+
+    <!-- TWGL: A Tiny WebGL helper Library, https://twgljs.org/ -->
+    <script src="./js/twgl.js"></script>
+
+    <!-- Tweakpane: Compact pane library for fine-tuning parameters, https://cocopon.github.io/tweakpane/ -->
+    <script src="./js/tweakpane-4.0.0.js"></script>
+
+    <!--  implementation of an arcball controller, see https://en.wikibooks.org/wiki/OpenGL_Programming/Modern_OpenGL_Tutorial_Arcball -->
+    <script src="./js/arcball.js"></script>
+
+    <!-- parser for the Wavefront OBJ (and MTL) file format, based on https://webgl2fundamentals.org/webgl/webgl-load-obj-w-mtl-w-normal-maps.html -->
+    <script src="./js/parseobj.js"></script>
+
+    <!-- wrapper for IndexedDB object store for saving settings  -->
+    <script src="./js/storage.js"></script>
+
+    <!-- utility functions for ui, file loading, etc. to not clutter up this file  -->
+    <script src="./js/util.js"></script>
+
+    <canvas id="canvas" tabindex="0" autofocus></canvas>
+    <div id="pane"></div>
+
+    <!-- our vertex shader; it handles the processing of individual vertices, see https://www.khronos.org/opengl/wiki/Vertex_Shader -->
+    <script id="vs" type="x-shader/x-vertex">
+        #version 300 es
+
+        in vec4 a_position;       
+        out vec4 v_position;
+        
+
+        void main() {
+          
+          v_position = a_position;
+          gl_Position = a_position;
+        }
+    </script>
+
+    <!-- our fragment shader; reponsible for determining the output (color, depth, etc.) for each sample of a rasterized primitive (fragment), see https://www.khronos.org/opengl/wiki/Fragment_Shader -->
+    <script id="fs" type="x-shader/x-fragment">
+        #version 300 es
+        precision highp float;
+
+        uniform mat4 modelViewProjection;
+        uniform mat4 inverseModelViewProjection;        
+
+        in vec4 v_position;
+        out vec4 outColor;
+
+        struct Ray {
+            vec3 origin;
+            vec3 direction;
+        };
+
+        struct Light {
+            vec3 color;
+            vec3 direction;
+        };
+
+        struct Material {
+            vec3 color;
+            float diffuse;
+            float specular;
+        };
+
+        struct Intersection {
+            float t;
+            vec3 position;
+            vec3 normal;
+            Material material;
+        };
+
+        struct Kugel {
+            vec3 center;
+            float radius;
+            Material material;
+        };
+
+        struct Plane {
+            vec3 normal;
+            Material material;
+        };
+
+        uniform vec3 KugelFarbe1;
+        uniform vec3 KugelFarbe2;
+        uniform vec3 KugelFarbe3;
+        uniform float SpiegelungKugel1;
+        uniform float SpiegelungKugel2;
+        uniform float SpiegelungKugel3;
+        uniform float StruungKugel1;
+        uniform float StruungKugel2;
+        uniform float StruungKugel3;
+        uniform vec3 Kugel1Punkt;
+        uniform vec3 Kugel2Punkt;
+        uniform vec3 Kugel3Punkt;
+        uniform float Kugel1Radius;
+        uniform float Kugel2Radius;
+        uniform float Kugel3Radius;
+        //Konstanten
+        const float epsilon = 1e-3;
+        const int iterations = 16;
+        //Licht
+        const float exposure = 1e-2;
+        const float gamma = 2.2;
+        const float intensity = 100.0;
+        const vec3 ambient = vec3(0.6, 0.8, 1.0) * intensity / gamma;
+
+        Light light = Light(vec3(1.0) * intensity, normalize(vec3(-1.0, 0.75, 1.0)));
+
+        const Intersection miss = Intersection(0.0, vec3(0.0), vec3(0.0), Material(vec3(0.0), 0.0, 0.0));
+
+        Intersection intersect(Ray ray, Kugel kugel)
+        {
+            Intersection result = miss;
+
+            vec3 oc = ray.origin - kugel.center;
+            float b = dot(oc, ray.direction);
+            float c = dot(oc, oc) - kugel.radius*kugel.radius;
+            float rr = b*b - c;
+
+            if (rr > 0.0) {
+                result.t = -b - sqrt(rr);
+
+                // if we are inside the sphere (i.e., the intersection point is behind the ray origin)
+                if (result.t < 0.0)
+                    result.t = -b + sqrt(rr);
+
+                result.position = ray.origin + result.t*ray.direction;
+                result.normal = normalize(result.position - kugel.center);
+                result.material = kugel.material;
+                return result;
+            }
+            return result;
+        }
+        
+        Intersection intersect(Ray ray, Plane plane) {
+            float t = -dot(ray.origin, plane.normal) / dot(ray.direction, plane.normal);
+            if (t < 0.0) return miss;
+            return Intersection(t, ray.origin + t*ray.direction, plane.normal, plane.material);
+        }
+        
+        
+        float calculateDepth(vec3 pos)
+        {
+            float far = gl_DepthRange.far; 
+            float near = gl_DepthRange.near;
+            vec4 clip_space_pos = modelViewProjection * vec4(pos, 1.0);
+            float ndc_depth = clip_space_pos.z / clip_space_pos.w;
+            return (((far - near) * ndc_depth) + near + far) / 2.0;
+        }        
+
+        Intersection trace(Ray ray) {
+            const int num_kugeln = 3;
+            Kugel kugeln[num_kugeln];
+        
+            kugeln[0] = Kugel(
+                vec3(Kugel1Punkt), 
+                Kugel1Radius,  
+                Material(vec3(KugelFarbe1), StruungKugel1, SpiegelungKugel1));
+                kugeln[1] = Kugel( 
+                vec3(Kugel2Punkt), 
+                Kugel2Radius, 
+                Material(vec3(KugelFarbe2), StruungKugel2, SpiegelungKugel2));
+                kugeln[2] = Kugel( 
+                vec3(Kugel3Punkt), 
+                Kugel3Radius, 
+                Material(vec3(KugelFarbe3), StruungKugel3, SpiegelungKugel3));
+        
+            Plane ground = Plane(
+                vec3(0, 1, 0),
+                Material(vec3(1.0, 1.0, 1.0), 1.0, 0.0));
+            
+            Intersection hit = miss;
+            Intersection plane = intersect(ray, ground);
+            float depth = 1.0;
+            if (plane.material.diffuse > 0.0 || plane.material.specular > 0.0) {
+                hit = plane;
+                depth = calculateDepth(hit.position);
+            }
+        
+            for (int i = 0; i < num_kugeln; i++) {
+                Intersection tmp = intersect(ray, kugeln[i]);
+                float tmp_depth = calculateDepth(tmp.position);
+                if (tmp.t > 0.0 && tmp_depth < depth) {
+                    depth = tmp_depth;
+                    hit = tmp;
+                }
+            }
+        
+            return hit;
+        }
+
+        vec3 radiance(Ray ray) {
+            vec3 color = vec3(0.0), fresnel = vec3(0.0);
+            vec3 mask = vec3(1.0);
+            for (int i = 0; i <= iterations; ++i) {
+                Intersection hit = trace(ray);
+        
+                if (hit.material.diffuse > 0.0 || hit.material.specular > 0.0) {
+        
+                   
+        
+                    vec3 r0 = hit.material.color.rgb * hit.material.specular;
+                    float hv = clamp(dot(hit.normal, -ray.direction), 0.0, 1.0);
+                    fresnel = r0 + (1.0 - r0) * pow(1.0 - hv, 5.0);
+                    mask *= fresnel;
+        
+        
+                    if (trace(Ray(ray.origin + hit.t * ray.direction + epsilon * light.direction, light.direction)) == miss) {
+                        color += clamp(dot(hit.normal, light.direction), 0.0, 1.0) * light.color
+                               * hit.material.color.rgb * hit.material.diffuse
+                               * (1.0 - fresnel) * mask / fresnel;
+                    }
+        
+                    vec3 reflection = reflect(ray.direction, hit.normal);
+                    ray = Ray(ray.origin + hit.t * ray.direction + epsilon * reflection, reflection);
+        
+                } else {
+        
+                    vec3 spotlight = vec3(1e6) * pow(abs(dot(ray.direction, light.direction)), 250.0);
+                    color += mask * (ambient + spotlight); break;
+                }
+            }
+            return color;
+        }
+
+        void main() {
+            vec4 near = inverseModelViewProjection*vec4(v_position.xy,-1.0,1.0);
+            near /= near.w;
+        
+            vec4 far = inverseModelViewProjection*vec4(v_position.xy,1.0,1.0);
+            far /= far.w;
+        
+            // this is the setup for our viewing ray
+            vec3 rayOrigin = near.xyz;
+            vec3 rayDirection = normalize((far-near).xyz);
+        
+            Ray r = Ray(rayOrigin,rayDirection);
+        
+            outColor = vec4(pow(radiance(r) * exposure, vec3(1.0 / gamma)), 1.0);
+        }
+    </script>
+
+    <!-- our main code -->
+    <script type="module">
+        // our WebGL context
+        const gl = document.querySelector("#canvas").getContext("webgl2");
+
+        // our default settings
+        const defaultSettings = {
+            objects: {},
+            materials: {},
+            background: { r: 1, g: 1, b: 1 },
+            fov: 60,
+            perspective: true,
+            // all custom parameters need to have a default value
+            //myParameter: 50,
+            KugelFarbe1: {r: 1.0, g: 0.0, b: 0.2},
+            KugelFarbe2: {r: 0.0, g: 0.2, b: 1.0},
+            KugelFarbe3: {r: 1.0, g: 1.0, b: 1.0},
+            SpiegelungKugel1: 0.001,
+            SpiegelungKugel2: 0.0,
+            SpiegelungKugel3: 0.25,
+            StruungKugel1: 1.0,
+            StruungKugel2: 1.0,
+            StruungKugel3: 0.5,
+            Kugel1Punkt: {x:-4.0, y: 2.0, z: 0.0},
+            Kugel2Punkt: {x: 4.0, y: 3.0, z: 0.0},
+            Kugel3Punkt: {x: 0.5, y: 1.0, z: 6.0},
+            Kugel1Radius: 2.0,
+            Kugel2Radius: 3.0,
+            Kugel3Radius: 1.0,
+        };
+
+        // set up our default view matrix
+        const eye = [0, 0, 2.0 * Math.sqrt(3.0)];
+        const target = [0, 1, 0];
+        const up = [0, 1, 0];
+        defaultSettings.view = glMatrix.mat4.create();
+        glMatrix.mat4.lookAt(defaultSettings.view, eye, target, up);
+
+        // our default material
+        const defaultMaterial = {
+            diffuse: [1, 1, 1],
+            ambient: [0, 0, 0],
+            specular: [1, 1, 1],
+            emissive: [0, 0, 0],
+            shininess: 400,
+            diffuseMap: "",
+        };
+
+        const environment = {
+            store: new Storage("coast"),
+            gl,
+            ui: {},
+            scene: {},
+            materials: {},
+            images: { "": null },
+            textures: {},
+            settings: defaultSettings,
+            defaults: {
+                settings: defaultSettings,
+                material: defaultMaterial,
+            },
+            statistics: {
+                totalVertices: 0,
+                renderedVertices: 0,
+                framesPerSecond: 0,
+            },
+        };
+
+        let previousTime = null;
+
+        // here we initialize our shaders
+        twgl.setAttributePrefix("a_");
+        environment.programInfo = twgl.createProgramInfo(gl, ["vs", "fs"]);
+
+        environment.arrays = {
+            position: [-1, -1, 0, 1, -1, 0, -1, 1, 0, -1, 1, 0, 1, -1, 0, 1, 1, 0],
+        };
+        environment.bufferInfo = twgl.createBufferInfoFromArrays(gl, environment.arrays);
+
+
+        // we want to store our settings when the page is reloaded or the tab is closed, but some of these events are triggered unreliably on different platforms
+        // this combination seems to work in all of the tested environments       
+        window.addEventListener("pagehide", (event) => { saveSettings(environment); });
+        window.addEventListener("beforeunload", (event) => { saveSettings(environment); });
+        document.addEventListener("visibilitychange", (event) => { saveSettings(environment); });
+
+        // set up our user interface
+        setupInterface(environment);
+
+        // restore data and settings
+        restoreSession(environment, function (env) {
+            // add any custom UI elements/input bindings here; make sure to add a proper default value to defaultSettings
+            /* const myFolder = env.ui.settingsPane.addFolder({title:"My Custom Folder"});
+            myFolder.addBinding(env.settings,"myParameter", {
+                min: 0,
+                max: 100,
+            }); */
+            const materialeinstellungen = env.ui.generalPane.addFolder({title: "Material Settings"});
+            const kugeleigenstaften = env.ui.generalPane.addFolder({title: "Sphere Attributes"});
+
+            kugeleigenstaften.addBinding(env.settings,"Kugel1Punkt",{
+                label: "Sphere 1 Center",
+                min: -10.0,
+                max:  10.0,
+            });
+
+            kugeleigenstaften.addBinding(env.settings,"Kugel2Punkt",{
+                label: "Sphere 2 Center",
+                min: -10.0,
+                max:  10.0,
+            });
+
+            kugeleigenstaften.addBinding(env.settings,"Kugel2Punkt",{
+                label: "Sphere 3 Center",
+                min: -10.0,
+                max:  10.0,
+            });
+
+            kugeleigenstaften.addBinding(env.settings,"Kugel1Radius",{
+                label: "Sphere 1 Radius",
+                min:  1.0,
+                max:  10.0,
+            });
+
+            kugeleigenstaften.addBinding(env.settings,"Kugel2Radius",{
+                label: "Sphere 2 Radius",
+                min:  1.0,
+                max:  10.0,
+            });
+
+            kugeleigenstaften.addBinding(env.settings,"Kugel3Radius",{
+                label: "Sphere 3 Radius",
+                min:  1.0,
+                max:  10.0,
+            });
+
+            materialeinstellungen.addBinding(env.settings,"KugelFarbe1",{
+                label: "Sphere 1 Color",
+                color: {type: "float"},
+            });
+
+            materialeinstellungen.addBinding(env.settings,"KugelFarbe2",{
+                label: "Sphere 2 Color",
+                color: {type: "float"},
+            });
+
+            materialeinstellungen.addBinding(env.settings,"KugelFarbe3",{
+                label: "Sphere 3 Color",
+                color: {type: "float"},
+            });
+
+            materialeinstellungen.addBinding(env.settings,"StruungKugel1",{
+                label: "Diffuse Contribution Sphere 1",
+                min: 0.0,
+                max: 1.0,
+            });
+
+            materialeinstellungen.addBinding(env.settings,"StruungKugel2",{
+                label: "Diffuse Contribution Sphere 2",
+                min: 0.0,
+                max: 1.0,
+            });
+
+            materialeinstellungen.addBinding(env.settings,"StruungKugel3",{
+                label: "Diffuse Contribution Sphere 3",
+                min: 0.0,
+                max: 1.0,
+            });
+
+            materialeinstellungen.addBinding(env.settings,"SpiegelungKugel1",{
+                label: "Specular Contribution Sphere 1",
+                min: 0.0,
+                max: 1.0,
+            });
+
+            materialeinstellungen.addBinding(env.settings,"SpiegelungKugel2",{
+                label: "Specular Contribution Sphere 2",
+                min: 0.0,
+                max: 1.0,
+            });
+
+            materialeinstellungen.addBinding(env.settings,"SpiegelungKugel3",{
+                label: "Specular Contribution Sphere 3",
+                min: 0.0,
+                max: 1.0,
+            });
+        });
+
+        // start the render loop
+        requestAnimationFrame(render);
+
+
+        // our render function
+        function render(time) {
+
+            if (!previousTime)
+                previousTime = time;
+
+            const timeDelta = 0.001 * (time - previousTime);
+            environment.controller.animate(timeDelta);
+
+            environment.statistics.framesPerSecond = timeDelta > 0.0 ? 1.0 / timeDelta : 0.0;
+            previousTime = time;
+
+            twgl.resizeCanvasToDisplaySize(gl.canvas);
+            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LESS);
+            gl.enable(gl.CULL_FACE);
+            gl.cullFace(gl.BACK);
+            gl.clearColor(environment.settings.background.r, environment.settings.background.g, environment.settings.background.b, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+
+            const fov = environment.settings.fov * Math.PI / 180;
+            const aspect = gl.canvas.clientWidth / gl.canvas.clientHeight;
+            const zNear = 0.125;
+            const zFar = 256.0;
+            let projection = glMatrix.mat4.create();
+
+            if (environment.settings.perspective) {
+                // set up our perspective projection matrix
+                projection = glMatrix.mat4.perspective(projection, fov, aspect, zNear, zFar);
+            } else {
+                // set up a orthographic projection matrix that approximates our perspective projection
+                const top = 2.0 * Math.sqrt(3.0) * Math.tan(0.5 * fov);
+                const right = top * aspect;
+                projection = glMatrix.mat4.ortho(projection, -right, right, -top, top, zNear, zFar);
+            }
+
+            // our model matrix transforms the object coordinates into a normalized and centered coordinate system
+            const minBounds = glMatrix.vec3.fromValues(-1.0, -1.0, -1.0);
+            const maxBounds = glMatrix.vec3.fromValues(1.0, 1.0, 1.0);
+            const extent = glMatrix.vec3.create();
+            const offset = glMatrix.vec3.create();
+            glMatrix.vec3.subtract(extent, maxBounds, minBounds);
+            glMatrix.vec3.scaleAndAdd(offset, minBounds, extent, 0.5);
+            glMatrix.vec3.negate(offset, offset);
+            const maxDim = Math.max(extent[0], extent[1], extent[2]);
+            const scale = 2.0 / maxDim;
+
+            const model = glMatrix.mat4.create();
+            glMatrix.mat4.scale(model, model, [scale, scale, scale]);
+            glMatrix.mat4.translate(model, model, offset);
+
+            // some common matrices that might come in handy
+            const modelView = glMatrix.mat4.create();
+            glMatrix.mat4.multiply(modelView, environment.settings.view, model);
+
+            const inverseModelView = glMatrix.mat4.create();
+            glMatrix.mat4.invert(inverseModelView, modelView);
+
+            const transposeInverseModelView = glMatrix.mat4.create();
+            glMatrix.mat4.transpose(transposeInverseModelView, inverseModelView);
+
+            const modelViewProjection = glMatrix.mat4.create();
+            glMatrix.mat4.multiply(modelViewProjection, projection, modelView);
+
+            const inverseModelViewProjection = glMatrix.mat4.create();
+            glMatrix.mat4.invert(inverseModelViewProjection, modelViewProjection);
+
+            const KugelFarbe1 = [
+                    environment.settings.KugelFarbe1.r,
+                    environment.settings.KugelFarbe1.g,
+                    environment.settings.KugelFarbe1.b,
+                ];
+            const KugelFarbe2 = [
+                    environment.settings.KugelFarbe2.r,
+                    environment.settings.KugelFarbe2.g,
+                    environment.settings.KugelFarbe2.b,
+                ];
+            const KugelFarbe3 = [
+                    environment.settings.KugelFarbe3.r,
+                    environment.settings.KugelFarbe3.g,
+                    environment.settings.KugelFarbe3.b,
+                ];
+            const SpiegelungKugel1 = environment.settings.SpiegelungKugel1;
+            const SpiegelungKugel2 = environment.settings.SpiegelungKugel2;
+            const SpiegelungKugel3 = environment.settings.SpiegelungKugel3;
+            const StruungKugel1 = environment.settings.StruungKugel1;
+            const StruungKugel2 = environment.settings.StruungKugel2;
+            const StruungKugel3 = environment.settings.StruungKugel3;
+
+            const Kugel1Punkt = [
+                    environment.settings.Kugel1Punkt.x,
+                    environment.settings.Kugel1Punkt.y,
+                    environment.settings.Kugel1Punkt.z,
+                ];
+
+            const Kugel2Punkt = [
+                    environment.settings.Kugel2Punkt.x,
+                    environment.settings.Kugel2Punkt.y,
+                    environment.settings.Kugel2Punkt.z,
+                ];
+
+            const Kugel3Punkt = [
+                    environment.settings.Kugel3Punkt.x,
+                    environment.settings.Kugel3Punkt.y,
+                    environment.settings.Kugel3Punkt.z,
+                ];
+
+            const Kugel1Radius = environment.settings.Kugel1Radius;
+            const Kugel2Radius = environment.settings.Kugel2Radius;
+            const Kugel3Radius = environment.settings.Kugel3Radius;
+
+            // these are the values actually passed to our shaders
+            const uniforms = {
+                modelViewProjection,
+                inverseModelViewProjection,
+                KugelFarbe1,
+                KugelFarbe2,
+                KugelFarbe3,
+                SpiegelungKugel1,
+                SpiegelungKugel2,
+                SpiegelungKugel3,
+                StruungKugel1,
+                StruungKugel2,
+                StruungKugel3,
+                Kugel1Punkt,
+                Kugel2Punkt,
+                Kugel3Punkt,
+                Kugel1Radius,
+                Kugel2Radius,
+                Kugel3Radius
+            };
+
+            gl.useProgram(environment.programInfo.program);
+            twgl.setUniforms(environment.programInfo, uniforms);
+
+
+            twgl.setBuffersAndAttributes(gl, environment.programInfo, environment.bufferInfo);
+            twgl.drawBufferInfo(gl, environment.bufferInfo);
+
+            environment.statistics.totalVertices = 0;
+            environment.statistics.renderedVertices = 0;
+
+            // we continuously render frames
+            requestAnimationFrame(render);
+        }
+
+    </script>
+
+</body>
+
+</html>
